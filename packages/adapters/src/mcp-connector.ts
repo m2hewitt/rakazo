@@ -17,8 +17,9 @@ import {
   lazyCatalogTools,
   resolveCatalogCall,
 } from "./lazy-tool-catalog.js";
+import { McpCatalogCache, type McpListedTool } from "./mcp-catalog-cache.js";
 import type { McpOAuthBroker, OAuthMaterial } from "./mcp-oauth.js";
-import { McpSession } from "./mcp-transport.js";
+import { McpSession, mcpSessionSurvivesError } from "./mcp-transport.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
 import type { EncryptedSecretStore } from "./secrets.js";
 
@@ -67,6 +68,7 @@ function reportAllowlistDrift(
 export class McpConnector implements ConnectorProvider {
   private readonly sessions = new Map<string, SessionEntry>();
   private readonly connecting = new Map<string, PendingSession>();
+  private readonly catalog: McpCatalogCache;
   constructor(
     private readonly prisma: PrismaClient,
     private readonly secrets: EncryptedSecretStore,
@@ -74,9 +76,13 @@ export class McpConnector implements ConnectorProvider {
       stdioEnabled?: boolean;
       allowedCommands?: string[];
       network?: RemoteTransportDependencies;
+      catalogTtlMs?: number;
+      now?: () => number;
     } = {},
     private readonly oauth?: McpOAuthBroker,
-  ) {}
+  ) {
+    this.catalog = new McpCatalogCache({ ttlMs: options.catalogTtlMs, now: options.now });
+  }
 
   describe() {
     return {
@@ -115,40 +121,70 @@ export class McpConnector implements ConnectorProvider {
     });
     const groups = await Promise.all(
       assignments.map(async (assignment): Promise<ConnectorTool[]> => {
-        try {
-          const session = await this.sessionFor(assignment.server, context);
-          const listed = await session.listTools({ signal: context.signal });
-          reportAllowlistDrift(assignment, listed.tools, context);
-          return listed.tools
-            .filter(
-              (tool) =>
-                assignment.allowAllTools ||
-                (assignment.allowedTools as unknown[]).includes(tool.name),
-            )
-            .map((tool) => ({
-              name: `mcp__${assignment.server.slug}__${tool.name}`,
-              description: tool.description ?? tool.name,
-              inputSchema: tool.inputSchema as Record<string, unknown>,
-              route: {
-                connectorId: "mcp",
-                resourceId: assignment.serverId,
-                resourceRevision: assignment.server.revision,
-                toolName: tool.name,
-                catalogGroup: assignment.server.slug,
-              },
-            }));
-        } catch (error) {
-          // A single unavailable server must not hide tools from other connectors.
-          console.error(
-            `mcp discovery failed for server ${assignment.server.slug}:`,
-            sanitizeConnectorError(error),
-          );
-          await this.evict(this.sessionKey(assignment.server, context));
-          return [];
-        }
+        const offered = await this.catalogFor(assignment.server, context);
+        if (!offered) return [];
+        reportAllowlistDrift(assignment, offered, context);
+        return offered
+          .filter(
+            (tool) =>
+              assignment.allowAllTools ||
+              (assignment.allowedTools as unknown[]).includes(tool.name),
+          )
+          .map((tool) => ({
+            name: `mcp__${assignment.server.slug}__${tool.name}`,
+            description: tool.description ?? tool.name,
+            inputSchema: tool.inputSchema,
+            route: {
+              connectorId: "mcp",
+              resourceId: assignment.serverId,
+              resourceRevision: assignment.server.revision,
+              toolName: tool.name,
+              catalogGroup: assignment.server.slug,
+            },
+          }));
       }),
     );
     return groups.flat();
+  }
+
+  /**
+   * The tools one server offers, independent of which bot asked. Returns undefined only when the
+   * server has never produced a catalog on this revision: a bot that had tools a moment ago keeps
+   * them through a failed refresh rather than reporting that its MCP disappeared.
+   */
+  private async catalogFor(
+    server: McpServer,
+    context: AdapterContext,
+  ): Promise<McpListedTool[] | undefined> {
+    const key = this.sessionKey(server, context);
+    const outcome = await this.catalog.get(key, server.revision, async () => {
+      const session = await this.sessionFor(server, context);
+      const listed = await session.listTools({ signal: context.signal });
+      return listed.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema as Record<string, unknown>,
+      }));
+    });
+
+    if (outcome.status === "hit" || outcome.status === "refreshed") return outcome.tools;
+    // Only a session that cannot carry the next request is worth dropping: reconnecting after a
+    // server-side 429 or 5xx adds a handshake to a server that already said it was overloaded.
+    if (!mcpSessionSurvivesError(outcome.error)) await this.evict(key);
+    if (outcome.status === "stale") {
+      console.warn(
+        `mcp catalog refresh failed for server ${server.slug}, serving ${outcome.tools.length} cached tools:`,
+        sanitizeConnectorError(outcome.error),
+        { spaceId: context.spaceId, botId: context.botId, ageMs: outcome.ageMs },
+      );
+      return outcome.tools;
+    }
+    // A single unavailable server must not hide tools from other connectors.
+    console.error(
+      `mcp discovery failed for server ${server.slug}:`,
+      sanitizeConnectorError(outcome.error),
+    );
+    return undefined;
   }
 
   async *execute(call: ConnectorCall, context: AdapterContext): AsyncIterable<ConnectorEvent> {
@@ -213,6 +249,7 @@ export class McpConnector implements ConnectorProvider {
     await Promise.all([...this.sessions.values()].map(({ session }) => session.close()));
     this.sessions.clear();
     this.connecting.clear();
+    this.catalog.clear();
   }
 
   private sessionKey(server: McpServer, context: AdapterContext): string {
@@ -255,6 +292,8 @@ export class McpConnector implements ConnectorProvider {
 
   private async connectSession(server: McpServer, context: AdapterContext): Promise<McpSession> {
     const session = new McpSession({ name: `rakazo-${server.slug}` });
+    const catalogKey = this.sessionKey(server, context);
+    session.onToolListChanged(() => this.catalog.markStale(catalogKey));
     try {
       const secret = server.secretId
         ? await this.prisma.secret.findFirst({

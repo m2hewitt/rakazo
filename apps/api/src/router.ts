@@ -2509,6 +2509,25 @@ export function createRouter(deps: RouterDeps) {
           });
           return mcpServerDto(row, await mcpOAuth.statusFor(row, context.actor));
         }),
+        refresh: authed.mcp.servers.refresh.handler(async ({ context, input }) => {
+          // The API and the worker each cache catalogs in their own memory, and the revision is
+          // the one invalidation signal both already read from the row on every discovery.
+          // Bumping it is how a refresh here reaches the process that actually runs the bots.
+          const existing = await deps.prisma.mcpServer.findFirst({
+            where: {
+              id: input.id,
+              spaceId: context.actor.spaceId,
+              userId: context.actor.userId,
+            },
+            select: { id: true },
+          });
+          if (!existing) throw new IsolationError();
+          const row = await deps.prisma.mcpServer.update({
+            where: { id: existing.id },
+            data: { revision: { increment: 1 } },
+          });
+          return mcpServerDto(row, await mcpOAuth.statusFor(row, context.actor));
+        }),
         remove: authed.mcp.servers.remove.handler(async ({ context, input }) => {
           const server = await deps.prisma.mcpServer.findFirst({
             where: {

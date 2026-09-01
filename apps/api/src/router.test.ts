@@ -163,6 +163,88 @@ describe("thread answer delivery", () => {
   });
 });
 
+describe("MCP tool catalog refresh", () => {
+  const SERVER_ROW = {
+    id: "server-1",
+    spaceId: "workspace-1",
+    slug: "ad",
+    name: "AD",
+    description: "",
+    transport: "streamable_http",
+    endpoint: "https://mcp.example.test/mcp",
+    command: null,
+    args: [],
+    env: {},
+    headers: {},
+    secretId: null,
+    enabled: true,
+    revision: 8,
+    createdAt: new Date("2026-08-26T00:00:00.000Z"),
+    updatedAt: new Date("2026-08-26T00:00:00.000Z"),
+  };
+
+  function refreshDeps(found: { id: string } | null) {
+    const update = vi.fn().mockResolvedValue({ ...SERVER_ROW, revision: 9 });
+    const prisma = {
+      mcpServer: { findFirst: vi.fn().mockResolvedValue(found), update },
+    } as unknown as PrismaClient;
+    const deps = {
+      prisma,
+      mcpOAuth: { statusFor: vi.fn().mockResolvedValue("none") },
+      env: {
+        defaultProvider: "fake",
+        defaultModel: "fake-model",
+        webOrigin: "http://127.0.0.1:5173",
+        screenProxySecret: "fake-test-secret",
+        sandboxProvider: "fake",
+      },
+      dataDir: "/tmp/rakazo-router-test",
+    } as unknown as RouterDeps;
+    const actor = {
+      spaceId: "workspace-1",
+      userId: "user-1",
+      email: "user@rakazo.test",
+      isDeploymentOwner: true,
+    } satisfies Actor;
+    return { update, handler: new RPCHandler(createRouter(deps)), actor };
+  }
+
+  function refresh(handler: RPCHandler<never>, actor: Actor, id: string) {
+    return handler.handle(
+      new Request("http://127.0.0.1/rpc/mcp/servers/refresh", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ json: { id } }),
+      }),
+      { prefix: "/rpc", context: { actor } },
+    );
+  }
+
+  it("bumps the revision so the worker's cached catalog is discarded too", async () => {
+    // The API and the worker cache catalogs in separate processes; the revision on the row is
+    // what both read on every discovery, so it is what a refresh has to move.
+    const { update, handler, actor } = refreshDeps({ id: "server-1" });
+
+    const { response } = await refresh(handler, actor, "server-1");
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({ json: { revision: 9 } });
+    expect(update).toHaveBeenCalledWith({
+      where: { id: "server-1" },
+      data: { revision: { increment: 1 } },
+    });
+  });
+
+  it("refuses to refresh a server outside the actor's space", async () => {
+    const { update, handler, actor } = refreshDeps(null);
+
+    const { response } = await refresh(handler, actor, "server-1");
+
+    expect(response.status).not.toBe(200);
+    expect(update).not.toHaveBeenCalled();
+  });
+});
+
 describe("MCP server deletion", () => {
   it("does not fail when a concurrent credential rotation already removed the old secret", async () => {
     const deleteServer = vi.fn().mockResolvedValue({ id: "server-1" });

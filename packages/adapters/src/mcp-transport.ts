@@ -7,7 +7,11 @@ import {
 } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import type { CallToolResult, ListToolsResult } from "@modelcontextprotocol/sdk/types.js";
+import {
+  type CallToolResult,
+  type ListToolsResult,
+  ToolListChangedNotificationSchema,
+} from "@modelcontextprotocol/sdk/types.js";
 import { isLocalMcpHost } from "@rakazo/contracts";
 import { combineSignals } from "./connector-safety.js";
 import {
@@ -230,6 +234,7 @@ export class McpSession {
   private remoteFetch?: SafeRemoteFetch;
   private connected = false;
   private connecting?: Promise<void>;
+  private toolListChanged?: () => void;
 
   constructor(options: McpClientOptions = {}) {
     this.clientOptions = options;
@@ -237,10 +242,25 @@ export class McpSession {
   }
 
   private newClient(): Client {
-    return new Client(
+    const client = new Client(
       { name: this.clientOptions.name ?? "rakazo", version: this.clientOptions.version ?? "0.1.0" },
       this.clientOptions.capabilities,
     );
+    if (this.toolListChanged) this.registerToolListChanged(client, this.toolListChanged);
+    return client;
+  }
+
+  private registerToolListChanged(client: Client, handler: () => void): void {
+    client.setNotificationHandler(ToolListChangedNotificationSchema, () => handler());
+  }
+
+  /**
+   * A server that announces changed tools saves the client from polling for them. The handler is
+   * re-registered on the replacement client an SSE fallback builds.
+   */
+  onToolListChanged(handler: () => void): void {
+    this.toolListChanged = handler;
+    this.registerToolListChanged(this.client, handler);
   }
 
   async connectRemote(
@@ -360,6 +380,42 @@ export class McpSession {
   private assertConnected(): void {
     if (!this.connected) throw new Error("MCP session is not connected");
   }
+}
+
+/**
+ * A server that answered — even to refuse — still holds the session it answered on. Cloudflare's
+ * 1102 is the case that motivated this: an MCP server that burns its CPU budget on `tools/list`
+ * returns 5xx, and tearing the session down made the next attempt pay for a fresh handshake.
+ * Streamable HTTP reports a dropped session as 404 on POST, so status is the signal to read.
+ */
+const SESSION_SURVIVES_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+/** Cloudflare's own edge failures, which say nothing about the origin's MCP session. */
+const CLOUDFLARE_EDGE_STATUS = { from: 520, to: 530 };
+
+function httpStatusOf(error: unknown): number | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const code = (error as { code?: unknown }).code;
+  if (typeof code === "number" && code >= 100 && code <= 599) return code;
+  const status = (error as { status?: unknown }).status;
+  if (typeof status === "number" && status >= 100 && status <= 599) return status;
+  return undefined;
+}
+
+export function mcpSessionSurvivesError(error: unknown): boolean {
+  // An aborted run says nothing about the server; the session is still whatever it was.
+  if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) {
+    return true;
+  }
+  const status = httpStatusOf(error);
+  if (status !== undefined) {
+    return (
+      SESSION_SURVIVES_STATUS.has(status) ||
+      (status >= CLOUDFLARE_EDGE_STATUS.from && status <= CLOUDFLARE_EDGE_STATUS.to)
+    );
+  }
+  // Without a status the error came from the transport or the protocol, not from the server's
+  // application layer, and a session that cannot carry a request is not worth keeping.
+  return false;
 }
 
 export { validateUrl };
