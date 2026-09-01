@@ -946,10 +946,30 @@ model McpServer {
   updatedAt     DateTime          @updatedAt
   assignments   BotMcpServer[]
   oauthSessions McpOAuthSession[]
+  catalogStatus McpCatalogStatus?
 
   @@unique([spaceId, userId, slug])
   @@index([spaceId, userId])
   @@map("mcp_servers")
+}
+
+/// What happened the last time a server's tools were listed. Discovery runs in the worker, whose
+/// catalog cache the API cannot see, so the outcome is written here for the UI to read.
+model McpCatalogStatus {
+  serverId    String    @id
+  server      McpServer @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  /// Server revision the cached tools were listed from; behind the server's own revision while a
+  /// requested refresh has not reached a run yet.
+  revision    Int?
+  toolCount   Int?
+  /// Last list that succeeded. Null until one has.
+  listedAt    DateTime?
+  /// Last list that was attempted, whether or not it succeeded.
+  refreshedAt DateTime
+  lastError   String?
+  lastErrorAt DateTime?
+
+  @@map("mcp_catalog_status")
 }
 
 model McpOAuthSession {

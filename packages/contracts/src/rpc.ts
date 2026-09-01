@@ -486,6 +486,8 @@ export const appContract = {
       list: oc.output(z.array(McpServerSchema)),
       create: oc.input(McpServerConfigInput).output(McpServerSchema),
       update: oc.input(z.object({ id: Id, config: McpServerConfigInput })).output(McpServerSchema),
+      /** Discard the cached tool catalog so the next run lists the server's tools again. */
+      refresh: oc.input(z.object({ id: Id })).output(McpServerSchema),
       remove: oc.input(z.object({ id: Id })).output(z.object({ ok: z.literal(true) })),
     },
     assignments: {

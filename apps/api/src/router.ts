@@ -245,6 +245,14 @@ function mcpServerDto(
     revision: number;
     createdAt: Date;
     updatedAt: Date;
+    catalogStatus?: {
+      revision: number | null;
+      toolCount: number | null;
+      listedAt: Date | null;
+      refreshedAt: Date;
+      lastError: string | null;
+      lastErrorAt: Date | null;
+    } | null;
   },
   oauthStatus: McpServer["oauthStatus"] = "none",
 ): McpServer {
@@ -273,6 +281,17 @@ function mcpServerDto(
     oauthStatus,
     enabled: row.enabled,
     revision: row.revision,
+    // Absent until discovery has run once for this server; the UI reads that as "not listed yet".
+    catalog: row.catalogStatus
+      ? {
+          revision: row.catalogStatus.revision,
+          toolCount: row.catalogStatus.toolCount,
+          listedAt: row.catalogStatus.listedAt?.toISOString() ?? null,
+          refreshedAt: row.catalogStatus.refreshedAt.toISOString(),
+          lastError: row.catalogStatus.lastError,
+          lastErrorAt: row.catalogStatus.lastErrorAt?.toISOString() ?? null,
+        }
+      : null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -2343,6 +2362,7 @@ export function createRouter(deps: RouterDeps) {
           const rows = await deps.prisma.mcpServer.findMany({
             where: { spaceId: context.actor.spaceId, userId: context.actor.userId },
             orderBy: [{ name: "asc" }, { createdAt: "asc" }],
+            include: { catalogStatus: true },
           });
           const secretIds = rows.flatMap((row) => (row.secretId ? [row.secretId] : []));
           const secrets = secretIds.length
@@ -2477,6 +2497,7 @@ export function createRouter(deps: RouterDeps) {
                 revision: { increment: 1 },
                 ...(stored ? { secretId: stored.id } : clearing ? { secretId: null } : {}),
               },
+              include: { catalogStatus: true },
             });
             if (stored) {
               await tx.secret.create({
@@ -2506,6 +2527,26 @@ export function createRouter(deps: RouterDeps) {
               });
             }
             return updated;
+          });
+          return mcpServerDto(row, await mcpOAuth.statusFor(row, context.actor));
+        }),
+        refresh: authed.mcp.servers.refresh.handler(async ({ context, input }) => {
+          // The API and the worker each cache catalogs in their own memory, and the revision is
+          // the one invalidation signal both already read from the row on every discovery.
+          // Bumping it is how a refresh here reaches the process that actually runs the bots.
+          const existing = await deps.prisma.mcpServer.findFirst({
+            where: {
+              id: input.id,
+              spaceId: context.actor.spaceId,
+              userId: context.actor.userId,
+            },
+            select: { id: true },
+          });
+          if (!existing) throw new IsolationError();
+          const row = await deps.prisma.mcpServer.update({
+            where: { id: existing.id },
+            data: { revision: { increment: 1 } },
+            include: { catalogStatus: true },
           });
           return mcpServerDto(row, await mcpOAuth.statusFor(row, context.actor));
         }),

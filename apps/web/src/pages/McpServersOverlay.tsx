@@ -4,6 +4,7 @@ import type { Bot, BotMcpServer, McpServer, McpTransport } from "@rakazo/contrac
 import { deriveMcpSlug } from "@rakazo/core";
 import { useEffect, useState } from "react";
 import { connectMcpOauth, MCP_OAUTH_CHANNEL } from "../lib/mcp-connect";
+import { formatRelativeTime } from "../lib/relative-time";
 import { rpc } from "../lib/rpc";
 
 function oauthStatusText(server: McpServer): string {
@@ -15,6 +16,50 @@ function oauthStatusText(server: McpServer): string {
 function oauthActionLabel(server: McpServer, pending: boolean): string {
   if (pending) return t`Connecting…`;
   return server.oauthStatus === "none" ? t`Connect OAuth` : t`Reconnect OAuth`;
+}
+
+const CATALOG_TONE = {
+  idle: "text-[#6E778A]",
+  ok: "text-[#6E778A]",
+  warn: "text-[#F0A15A]",
+  error: "text-[#F3A2AA]",
+} as const;
+
+/**
+ * Discovery runs when a bot runs, so a server can be saved and assigned long before its tools are
+ * ever listed. The states worth separating are: never listed, listed, listed but the last refresh
+ * failed (the bots still have those tools), and never listed successfully (they have none).
+ */
+function catalogStatus(server: McpServer): {
+  tone: keyof typeof CATALOG_TONE;
+  text: string;
+  detail?: string;
+} {
+  const catalog = server.catalog;
+  if (!catalog) return { tone: "idle", text: t`Tools not listed yet` };
+  const count = catalog.toolCount;
+  const failedAt = catalog.lastErrorAt ? formatRelativeTime(catalog.lastErrorAt) : "";
+  if (count === null) {
+    return {
+      tone: "error",
+      text: t`No tools — listing failed ${failedAt}`,
+      detail: catalog.lastError ?? undefined,
+    };
+  }
+  if (catalog.lastError) {
+    return {
+      tone: "warn",
+      text: t`${count} tools, still using the last list — refresh failed ${failedAt}`,
+      detail: catalog.lastError,
+    };
+  }
+  // A catalog listed from an older revision means a refresh was asked for and no run has
+  // listed since; the tools on offer are the ones from before the change.
+  if (catalog.revision !== null && catalog.revision < server.revision) {
+    return { tone: "idle", text: t`${count} tools — the next run lists them again` };
+  }
+  const listedAt = catalog.listedAt ? formatRelativeTime(catalog.listedAt) : "";
+  return { tone: "ok", text: t`${count} tools — listed ${listedAt}` };
 }
 
 export function McpServersOverlay({ onClose }: { onClose: () => void }) {
@@ -35,6 +80,7 @@ export function McpServersOverlay({ onClose }: { onClose: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [oauthPending, setOauthPending] = useState<string | null>(null);
+  const [refreshingCatalog, setRefreshingCatalog] = useState<string | null>(null);
 
   async function refresh() {
     const [nextServers, nextBots, assignments] = await Promise.all([
@@ -201,6 +247,19 @@ export function McpServersOverlay({ onClose }: { onClose: () => void }) {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : t`Could not delete MCP server`);
+    }
+  }
+
+  async function refreshCatalog(server: McpServer) {
+    setError(null);
+    setRefreshingCatalog(server.id);
+    try {
+      await rpc.mcp.servers.refresh({ id: server.id });
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t`Could not refresh tools`);
+    } finally {
+      setRefreshingCatalog(null);
     }
   }
 
@@ -407,83 +466,106 @@ export function McpServersOverlay({ onClose }: { onClose: () => void }) {
                     <Trans>No MCP servers yet.</Trans>
                   </p>
                 ) : (
-                  servers.map((server) => (
-                    <div
-                      key={server.id}
-                      className="rounded-xl border border-[#292930] bg-[#101012] p-4"
-                    >
-                      <div className="flex items-center justify-between">
-                        <span className="font-medium text-[#ECECEE]">{server.name}</span>
-                        <span className="rounded-full bg-[#202536] px-2 py-1 text-[10px] uppercase text-[#AEB7FF]">
-                          {server.transport.replace("_", " ")}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-xs text-[#77777F]">
-                        {server.endpoint ?? server.command ?? server.slug}
-                      </p>
-                      <p
-                        className={`mt-2 text-[11px] ${server.oauthStatus === "reconnect" ? "text-[#F0A15A]" : "text-[#6E778A]"}`}
+                  servers.map((server) => {
+                    const catalog = catalogStatus(server);
+                    return (
+                      <div
+                        key={server.id}
+                        className="rounded-xl border border-[#292930] bg-[#101012] p-4"
                       >
-                        {oauthStatusText(server)}
-                      </p>
-                      <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                        <span className="text-[11px] text-[#77777F]">
-                          <Trans>Agents:</Trans>
-                        </span>
-                        {bots.map((bot) => {
-                          const assigned = (botAssignments[bot.id] ?? []).some(
-                            (entry) => entry.serverId === server.id,
-                          );
-                          return (
-                            <button
-                              key={bot.id}
-                              type="button"
-                              onClick={() => void toggleAssignment(server, bot.id)}
-                              className={`rounded-full border px-2.5 py-1 text-[11px] ${assigned ? "border-[#7785FF] bg-[#30356A] text-[#E2E4FF]" : "border-[#34343B] text-[#85858B]"}`}
-                            >
-                              {assigned ? "✓ " : ""}
-                              {bot.name}
-                            </button>
-                          );
-                        })}
-                      </div>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {server.transport !== "stdio" ? (
-                          <>
-                            <button
-                              type="button"
-                              disabled={oauthPending === server.id}
-                              onClick={() => void connectOAuth(server)}
-                              className="rounded-lg bg-[#7785FF] px-3 py-2 text-xs font-semibold text-[#090A12] disabled:opacity-50"
-                            >
-                              {oauthActionLabel(server, oauthPending === server.id)}
-                            </button>
-                            {server.oauthStatus !== "none" ? (
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium text-[#ECECEE]">{server.name}</span>
+                          <span className="rounded-full bg-[#202536] px-2 py-1 text-[10px] uppercase text-[#AEB7FF]">
+                            {server.transport.replace("_", " ")}
+                          </span>
+                        </div>
+                        <p className="mt-1 text-xs text-[#77777F]">
+                          {server.endpoint ?? server.command ?? server.slug}
+                        </p>
+                        <p
+                          className={`mt-2 text-[11px] ${server.oauthStatus === "reconnect" ? "text-[#F0A15A]" : "text-[#6E778A]"}`}
+                        >
+                          {oauthStatusText(server)}
+                        </p>
+                        <p className={`mt-1 text-[11px] ${CATALOG_TONE[catalog.tone]}`}>
+                          {catalog.text}
+                        </p>
+                        {catalog.detail ? (
+                          <p className="mt-1 break-words text-[11px] text-[#77777F]">
+                            {catalog.detail}
+                          </p>
+                        ) : null}
+                        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                          <span className="text-[11px] text-[#77777F]">
+                            <Trans>Agents:</Trans>
+                          </span>
+                          {bots.map((bot) => {
+                            const assigned = (botAssignments[bot.id] ?? []).some(
+                              (entry) => entry.serverId === server.id,
+                            );
+                            return (
+                              <button
+                                key={bot.id}
+                                type="button"
+                                onClick={() => void toggleAssignment(server, bot.id)}
+                                className={`rounded-full border px-2.5 py-1 text-[11px] ${assigned ? "border-[#7785FF] bg-[#30356A] text-[#E2E4FF]" : "border-[#34343B] text-[#85858B]"}`}
+                              >
+                                {assigned ? "✓ " : ""}
+                                {bot.name}
+                              </button>
+                            );
+                          })}
+                        </div>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {server.transport !== "stdio" ? (
+                            <>
                               <button
                                 type="button"
                                 disabled={oauthPending === server.id}
-                                onClick={() => void disconnectOAuth(server)}
-                                className="rounded-lg border border-[#34343B] px-3 py-2 text-xs text-[#B9B9C0]"
+                                onClick={() => void connectOAuth(server)}
+                                className="rounded-lg bg-[#7785FF] px-3 py-2 text-xs font-semibold text-[#090A12] disabled:opacity-50"
                               >
-                                <Trans>Disconnect</Trans>
+                                {oauthActionLabel(server, oauthPending === server.id)}
                               </button>
-                            ) : null}
-                          </>
-                        ) : null}
-                        <button
-                          type="button"
-                          onClick={() => void deleteServer(server)}
-                          className={`ml-auto rounded-lg border px-3 py-2 text-xs ${confirmingDelete === server.id ? "border-[#B4434F] bg-[#3A1A20] text-[#F3A2AA]" : "border-[#34343B] text-[#B9B9C0]"}`}
-                        >
-                          {confirmingDelete === server.id ? (
-                            <Trans>Confirm delete</Trans>
-                          ) : (
-                            <Trans>Delete</Trans>
-                          )}
-                        </button>
+                              {server.oauthStatus !== "none" ? (
+                                <button
+                                  type="button"
+                                  disabled={oauthPending === server.id}
+                                  onClick={() => void disconnectOAuth(server)}
+                                  className="rounded-lg border border-[#34343B] px-3 py-2 text-xs text-[#B9B9C0]"
+                                >
+                                  <Trans>Disconnect</Trans>
+                                </button>
+                              ) : null}
+                            </>
+                          ) : null}
+                          <button
+                            type="button"
+                            disabled={refreshingCatalog === server.id}
+                            onClick={() => void refreshCatalog(server)}
+                            className="rounded-lg border border-[#34343B] px-3 py-2 text-xs text-[#B9B9C0] disabled:opacity-50"
+                          >
+                            {refreshingCatalog === server.id ? (
+                              <Trans>Refreshing…</Trans>
+                            ) : (
+                              <Trans>Refresh tools</Trans>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => void deleteServer(server)}
+                            className={`ml-auto rounded-lg border px-3 py-2 text-xs ${confirmingDelete === server.id ? "border-[#B4434F] bg-[#3A1A20] text-[#F3A2AA]" : "border-[#34343B] text-[#B9B9C0]"}`}
+                          >
+                            {confirmingDelete === server.id ? (
+                              <Trans>Confirm delete</Trans>
+                            ) : (
+                              <Trans>Delete</Trans>
+                            )}
+                          </button>
+                        </div>
                       </div>
-                    </div>
-                  ))
+                    );
+                  })
                 )}
               </div>
             </div>

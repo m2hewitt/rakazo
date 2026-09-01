@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { StoredMcpOAuthProvider } from "./mcp-oauth.js";
 import {
   McpSession,
+  mcpSessionSurvivesError,
   secureFetch,
   validateUrl,
   withEndpointOriginFallback,
@@ -378,5 +379,38 @@ describe("MCP transport seam", () => {
       }),
     ).rejects.toThrow("fetch failed");
     expect(inner).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("mcpSessionSurvivesError", () => {
+  it("keeps a session the server answered on while overloaded", () => {
+    // Cloudflare's 1102 reaches the client as a 5xx from a server that is otherwise reachable.
+    for (const code of [408, 425, 429, 500, 502, 503, 504, 520, 524, 530]) {
+      expect(mcpSessionSurvivesError(Object.assign(new Error("busy"), { code }))).toBe(true);
+    }
+  });
+
+  it("drops a session the server refused or no longer knows", () => {
+    // Streamable HTTP reports an expired session as a 404 on POST.
+    for (const code of [400, 401, 403, 404, 405, 410]) {
+      expect(mcpSessionSurvivesError(Object.assign(new Error("nope"), { code }))).toBe(false);
+    }
+  });
+
+  it("drops a session whose transport failed before any status came back", () => {
+    expect(mcpSessionSurvivesError(new TypeError("fetch failed"))).toBe(false);
+    expect(mcpSessionSurvivesError(new Error("MCP session is not connected"))).toBe(false);
+    expect(mcpSessionSurvivesError("socket hang up")).toBe(false);
+  });
+
+  it("reads a status reported as status rather than code", () => {
+    expect(mcpSessionSurvivesError({ status: 503 })).toBe(true);
+    expect(mcpSessionSurvivesError({ status: 401 })).toBe(false);
+  });
+
+  it("holds the session when the caller gave up rather than the server", () => {
+    const aborted = new Error("aborted");
+    aborted.name = "AbortError";
+    expect(mcpSessionSurvivesError(aborted)).toBe(true);
   });
 });
