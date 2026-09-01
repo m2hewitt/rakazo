@@ -109,6 +109,7 @@ describe("MCP connector session cache", () => {
         findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
         findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, {
       network: { resolveHostname: async () => [{ address: "203.0.113.10", family: 4 }] },
@@ -155,6 +156,7 @@ describe("MCP connector session cache", () => {
             findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
             findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
           },
+          mcpCatalogStatus: { upsert: vi.fn() },
         } as never,
         {} as never,
         { network: { resolveHostname: async () => [{ address: "203.0.113.10", family: 4 }] } },
@@ -212,6 +214,7 @@ describe("MCP connector session cache", () => {
         findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
         findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, {
       network: { resolveHostname: async () => [{ address: "203.0.113.10", family: 4 }] },
@@ -371,6 +374,7 @@ describe("MCP connector session cache", () => {
         findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
         findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, {
       network: { resolveHostname: async () => [{ address: "203.0.113.10", family: 4 }] },
@@ -402,6 +406,7 @@ describe("MCP connector session cache", () => {
     vi.stubGlobal("fetch", mcpFetch(state, "http://localhost:8123/api/mcp"));
     const prisma = {
       botMcpServer: { findMany: vi.fn().mockResolvedValue([localAssignment]) },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never);
 
@@ -426,6 +431,7 @@ describe("MCP connector session cache", () => {
     const prisma = {
       botMcpServer: { findMany: vi.fn().mockResolvedValue([localAssignment]) },
       secret: { findFirst: vi.fn().mockResolvedValue({ id: "secret-1", ciphertext: "encrypted" }) },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(
       prisma as never,
@@ -458,6 +464,7 @@ describe("MCP connector session cache", () => {
         findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
         findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, {
       network: {
@@ -502,6 +509,7 @@ describe("MCP connector session cache", () => {
         findMany: vi.fn().mockResolvedValue([ASSIGNMENT]),
         findFirst: vi.fn().mockResolvedValue(ASSIGNMENT),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, {
       network: { resolveHostname: async () => [{ address: "203.0.113.10", family: 4 }] },
@@ -539,12 +547,28 @@ describe("MCP connector catalog cache", () => {
         findMany: vi.fn().mockResolvedValue(assignments),
         findFirst: vi.fn().mockResolvedValue(assignments[0]),
       },
+      mcpCatalogStatus: { upsert: vi.fn().mockResolvedValue({}) },
     };
     return new McpConnector(prisma as never, {} as never, {
       network: NETWORK,
       catalogTtlMs: options.ttlMs,
       now: options.now,
     });
+  }
+
+  /** Same connector, with the status upsert exposed so a test can read what discovery recorded. */
+  function connectorRecordingStatus(options: { ttlMs?: number; now?: () => number } = {}) {
+    const upsert = vi.fn().mockResolvedValue({});
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) },
+      mcpCatalogStatus: { upsert },
+    };
+    const connector = new McpConnector(prisma as never, {} as never, {
+      network: NETWORK,
+      catalogTtlMs: options.ttlMs,
+      now: options.now,
+    });
+    return { connector, upsert };
   }
 
   it("lists a server's tools once across runs instead of once per run", async () => {
@@ -570,6 +594,7 @@ describe("MCP connector catalog cache", () => {
           { ...ASSIGNMENT, botId: where.botId },
         ]),
       },
+      mcpCatalogStatus: { upsert: vi.fn() },
     };
     const connector = new McpConnector(prisma as never, {} as never, { network: NETWORK });
 
@@ -674,7 +699,10 @@ describe("MCP connector catalog cache", () => {
     const state = { failNext: false, initializations: 0, lists: 0 };
     vi.stubGlobal("fetch", mcpFetch(state));
     const revised = { ...ASSIGNMENT, server: { ...SERVER, revision: 2 } };
-    const prisma = { botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) } };
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) },
+      mcpCatalogStatus: { upsert: vi.fn() },
+    };
     const connector = new McpConnector(prisma as never, {} as never, { network: NETWORK });
 
     await connector.discoverTools(contextFor("bot-1"));
@@ -739,6 +767,82 @@ describe("MCP connector catalog cache", () => {
     await connector.discoverTools(contextFor("bot-1"));
     expect(lists).toBe(2);
 
+    await connector.close();
+  });
+
+  it("records what a listing found so the API can report it", async () => {
+    const state = { failNext: false, initializations: 0, lists: 0 };
+    vi.stubGlobal("fetch", mcpFetch(state));
+    const { connector, upsert } = connectorRecordingStatus();
+
+    await connector.discoverTools(contextFor("bot-1"));
+
+    expect(upsert).toHaveBeenCalledTimes(1);
+    expect(upsert.mock.calls[0]?.[0]).toMatchObject({
+      where: { serverId: "server-1" },
+      update: { revision: 1, toolCount: 1, lastError: null, lastErrorAt: null },
+    });
+    await connector.close();
+  });
+
+  it("writes nothing for runs served from the cache", async () => {
+    let time = 1_000;
+    const state = { failNext: false, initializations: 0, lists: 0, listStatus: 0 };
+    vi.stubGlobal("fetch", mcpFetch(state));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { connector, upsert } = connectorRecordingStatus({ ttlMs: 60_000, now: () => time });
+
+    await connector.discoverTools(contextFor("bot-1"));
+    // Cache hits are not news about the server.
+    await connector.discoverTools(contextFor("bot-1"));
+    expect(upsert).toHaveBeenCalledTimes(1);
+
+    state.listStatus = 503;
+    time += 61_000;
+    await connector.discoverTools(contextFor("bot-1"));
+    expect(upsert).toHaveBeenCalledTimes(2);
+
+    // Neither is a run inside the backoff window, which never asks the server anything.
+    time += 1_000;
+    await connector.discoverTools(contextFor("bot-1"));
+    expect(upsert).toHaveBeenCalledTimes(2);
+    await connector.close();
+  });
+
+  it("records a failed refresh without discarding the tool count it last saw", async () => {
+    let time = 1_000;
+    const state = { failNext: false, initializations: 0, lists: 0, listStatus: 0 };
+    vi.stubGlobal("fetch", mcpFetch(state));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { connector, upsert } = connectorRecordingStatus({ ttlMs: 60_000, now: () => time });
+
+    await connector.discoverTools(contextFor("bot-1"));
+    state.listStatus = 503;
+    time += 61_000;
+    await connector.discoverTools(contextFor("bot-1"));
+
+    const update = upsert.mock.calls[1]?.[0]?.update as Record<string, unknown>;
+    expect(update.lastError).toEqual(expect.any(String));
+    // toolCount and listedAt are left alone, so the UI can still say how many tools are in play.
+    expect(update).not.toHaveProperty("toolCount");
+    expect(update).not.toHaveProperty("listedAt");
+    await connector.close();
+  });
+
+  it("keeps serving tools when the status write fails", async () => {
+    const state = { failNext: false, initializations: 0, lists: 0 };
+    vi.stubGlobal("fetch", mcpFetch(state));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) },
+      mcpCatalogStatus: { upsert: vi.fn().mockRejectedValue(new Error("db down")) },
+    };
+    const connector = new McpConnector(prisma as never, {} as never, { network: NETWORK });
+
+    // Status is a report about discovery, not part of it.
+    const tools = await connector.discoverTools(contextFor("bot-1"));
+
+    expect(tools.map((tool) => tool.name)).toEqual(["mcp__demo__echo"]);
     await connector.close();
   });
 

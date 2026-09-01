@@ -184,7 +184,19 @@ describe("MCP tool catalog refresh", () => {
   };
 
   function refreshDeps(found: { id: string } | null) {
-    const update = vi.fn().mockResolvedValue({ ...SERVER_ROW, revision: 9 });
+    // Discovery has not run since the bump, so the stored catalog still names the old revision.
+    const update = vi.fn().mockResolvedValue({
+      ...SERVER_ROW,
+      revision: 9,
+      catalogStatus: {
+        revision: 8,
+        toolCount: 14,
+        listedAt: new Date("2026-08-26T22:31:00.000Z"),
+        refreshedAt: new Date("2026-08-26T22:31:00.000Z"),
+        lastError: null,
+        lastErrorAt: null,
+      },
+    });
     const prisma = {
       mcpServer: { findFirst: vi.fn().mockResolvedValue(found), update },
     } as unknown as PrismaClient;
@@ -228,10 +240,18 @@ describe("MCP tool catalog refresh", () => {
     const { response } = await refresh(handler, actor, "server-1");
 
     expect(response.status).toBe(200);
-    await expect(response.json()).resolves.toMatchObject({ json: { revision: 9 } });
     expect(update).toHaveBeenCalledWith({
       where: { id: "server-1" },
       data: { revision: { increment: 1 } },
+      include: { catalogStatus: true },
+    });
+    // The bots keep the 14 tools they have; the lagging catalog revision is what tells the UI a
+    // refresh is still pending rather than done.
+    await expect(response.json()).resolves.toMatchObject({
+      json: {
+        revision: 9,
+        catalog: { revision: 8, toolCount: 14, lastError: null },
+      },
     });
   });
 

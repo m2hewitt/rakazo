@@ -531,6 +531,21 @@ export const McpServerConfigInput = z.discriminatedUnion("transport", [
 ]);
 export type McpServerConfigInput = z.infer<typeof McpServerConfigInput>;
 
+/**
+ * What discovery last saw when it listed a server's tools. `revision` is the server revision those
+ * tools came from: behind the server's own revision means a requested refresh has not reached a run
+ * yet. A `lastError` alongside a `toolCount` means the bots still have those tools.
+ */
+export const McpCatalogStatusSchema = z.object({
+  revision: z.number().int().positive().nullable(),
+  toolCount: z.number().int().nonnegative().nullable(),
+  listedAt: z.string().nullable(),
+  refreshedAt: z.string(),
+  lastError: z.string().nullable(),
+  lastErrorAt: z.string().nullable(),
+});
+export type McpCatalogStatus = z.infer<typeof McpCatalogStatusSchema>;
+
 export const McpServerSchema = z.object({
   id: Id,
   spaceId: Id,
@@ -547,6 +562,7 @@ export const McpServerSchema = z.object({
   oauthStatus: z.enum(["none", "connected", "reconnect"]),
   enabled: z.boolean(),
   revision: z.number().int().positive(),
+  catalog: McpCatalogStatusSchema.nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
 });

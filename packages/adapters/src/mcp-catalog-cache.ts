@@ -19,8 +19,11 @@ export const MCP_CATALOG_BACKOFF_MS = [30_000, 120_000, 600_000] as const;
 export type McpCatalogOutcome =
   | { status: "hit"; tools: McpListedTool[]; ageMs: number }
   | { status: "refreshed"; tools: McpListedTool[]; durationMs: number }
-  /** The refresh failed, or is backing off, but a catalog from before it survives. */
-  | { status: "stale"; tools: McpListedTool[]; ageMs: number; error: unknown }
+  /**
+   * The refresh failed, or is backing off, but a catalog from before it survives. `attempted`
+   * separates the two: only a real attempt is news worth recording about the server.
+   */
+  | { status: "stale"; tools: McpListedTool[]; ageMs: number; error: unknown; attempted: boolean }
   | { status: "failed"; error: unknown };
 
 type CatalogEntry = {
@@ -79,6 +82,7 @@ export class McpCatalogCache {
         tools: entry.tools,
         ageMs: this.now() - entry.fetchedAt,
         error: entry.lastError,
+        attempted: false,
       };
     }
 
@@ -94,6 +98,7 @@ export class McpCatalogCache {
         tools: survivor.tools,
         ageMs: this.now() - survivor.fetchedAt,
         error,
+        attempted: true,
       };
     }
   }

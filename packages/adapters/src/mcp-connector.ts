@@ -17,11 +17,18 @@ import {
   lazyCatalogTools,
   resolveCatalogCall,
 } from "./lazy-tool-catalog.js";
-import { McpCatalogCache, type McpListedTool } from "./mcp-catalog-cache.js";
+import {
+  McpCatalogCache,
+  type McpCatalogOutcome,
+  type McpListedTool,
+} from "./mcp-catalog-cache.js";
 import type { McpOAuthBroker, OAuthMaterial } from "./mcp-oauth.js";
 import { McpSession, mcpSessionSurvivesError } from "./mcp-transport.js";
 import type { RemoteTransportDependencies } from "./remote-mcp.js";
 import type { EncryptedSecretStore } from "./secrets.js";
+
+/** Long enough to identify the failure, short enough that a chatty server cannot bloat the row. */
+const MAX_STATUS_ERROR_LENGTH = 500;
 
 type SessionEntry = { session: McpSession; revision: number };
 type PendingSession = { revision: number; promise: Promise<McpSession> };
@@ -167,6 +174,8 @@ export class McpConnector implements ConnectorProvider {
       }));
     });
 
+    await this.recordCatalogStatus(server, outcome);
+
     if (outcome.status === "hit" || outcome.status === "refreshed") return outcome.tools;
     // Only a session that cannot carry the next request is worth dropping: reconnecting after a
     // server-side 429 or 5xx adds a handshake to a server that already said it was overloaded.
@@ -185,6 +194,41 @@ export class McpConnector implements ConnectorProvider {
       sanitizeConnectorError(outcome.error),
     );
     return undefined;
+  }
+
+  /**
+   * Discovery runs here, in the worker; the UI reads from the API. Only an actual listing is news,
+   * so a cache hit and a run inside a backoff window write nothing — at most one row per TTL.
+   */
+  private async recordCatalogStatus(server: McpServer, outcome: McpCatalogOutcome): Promise<void> {
+    if (outcome.status === "hit") return;
+    if (outcome.status === "stale" && !outcome.attempted) return;
+    const refreshedAt = new Date();
+    const status =
+      outcome.status === "refreshed"
+        ? {
+            revision: server.revision,
+            toolCount: outcome.tools.length,
+            listedAt: refreshedAt,
+            refreshedAt,
+            lastError: null,
+            lastErrorAt: null,
+          }
+        : {
+            refreshedAt,
+            lastError: sanitizeConnectorError(outcome.error).slice(0, MAX_STATUS_ERROR_LENGTH),
+            lastErrorAt: refreshedAt,
+          };
+    try {
+      await this.prisma.mcpCatalogStatus.upsert({
+        where: { serverId: server.id },
+        create: { serverId: server.id, ...status },
+        update: status,
+      });
+    } catch (error) {
+      // Status is a report about discovery, not part of it; losing it must not lose the tools.
+      console.error(`mcp catalog status write failed for server ${server.slug}:`, error);
+    }
   }
 
   async *execute(call: ConnectorCall, context: AdapterContext): AsyncIterable<ConnectorEvent> {
